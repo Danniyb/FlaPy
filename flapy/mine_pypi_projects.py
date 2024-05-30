@@ -1,16 +1,17 @@
-from typing import List, Dict, Tuple, Set, Any
+from typing import List, Dict, Tuple, Any
 import logging
 import random
 import re
 import subprocess
 import time
 
-from flapy.utils import try_default
+from utils import try_default
 from tqdm import tqdm
 import fire
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
+import toml  # Add this for parsing pyproject.toml
 
 
 GITHUB_URL_REGEX = r"https?://(www\.)?github\.com/[^/]+/[^/]+/?$"
@@ -26,15 +27,10 @@ def fetch_all_pypi_projects() -> List[str]:
 
     logging.info("parsing pypi projects")
     proj_names = [a.text for a in BeautifulSoup(r, "html.parser").find_all("a")]
-    # Remove first and last element since they are empty strings (bf4 parsing)
     return proj_names
 
 
 def _get_pypi_metadata(project_name: str) -> Tuple[str, str, Any]:
-    """
-    :project_name: PyPI project name
-    :returns: (status, http_response_code, json)
-    """
     try:
         response = requests.get(
             url=f"https://pypi.python.org/pypi/{project_name}/json",
@@ -51,7 +47,6 @@ def _get_pypi_metadata(project_name: str) -> Tuple[str, str, Any]:
 
 
 def _get_latest_pypi_tag(pypi_json: Dict) -> str:
-    """Given a PyPI metadata json derived from `_get_pypi_metadata`, return the latest release"""
     try:
         releases = pypi_json["releases"]
     except Exception:
@@ -76,15 +71,7 @@ def _is_valid_github_url(github_url: str) -> bool:
 
 
 def _get_git_tags(url: str) -> List[str]:
-    """
-    :param url: GitHub URL
-    :return: Set of all GitTag versions
-    """
-
-    # add pseudo credentials to avoid prompt
     search_url: str = url[:8] + "pseudocredentials:pseudocredentials@" + url[8:]
-
-    # obtain tags, if not found return empty set
     try:
         data: str = str(
             subprocess.check_output(
@@ -94,7 +81,6 @@ def _get_git_tags(url: str) -> List[str]:
     except subprocess.CalledProcessError:
         return set()
 
-    # parse git tags
     new_data: List[str] = data.split("\\n")
     tags: Set[str] = set()
     for d in new_data:
@@ -129,6 +115,20 @@ def resolve_url(url: str, max_retries=6, sleep_time=11) -> Tuple[str, int]:
         return None, None
 
 
+def _fetch_and_check_pyproject_toml(github_url: str) -> bool:
+    try:
+        response = requests.get(f"{github_url}/raw/main/pyproject.toml")
+        if response.status_code == 200:
+            pyproject_data = toml.loads(response.text)
+            dependencies = pyproject_data.get("tool", {}).get("poetry", {}).get("dependencies", {})
+            dev_dependencies = pyproject_data.get("tool", {}).get("poetry", {}).get("dev-dependencies", {})
+            if "pytest" in dependencies or "pytest" in dev_dependencies:
+                return True
+        return False
+    except Exception:
+        return False
+
+
 def sample_pypi_projects(
     *,
     sample_size: int = None,
@@ -138,39 +138,28 @@ def sample_pypi_projects(
     remove_duplicates: bool = True,
     remove_no_github_url_found: bool = True,
 ) -> str:
-    """
-
-    :sample_size: randomly sample `sample_size` number of projects
-    :returns: CSV-like table that can be used as flapy input
-
-    """
 
     if random_seed is not None:
         random.seed(random_seed)
 
-    # 1. Fetch all PyPI projects
     if project_list_file is None:
         projects = fetch_all_pypi_projects()
     else:
         with open(project_list_file) as f:
             projects = f.read().split("\n")
 
-    # 2. Random sampling
     if sample_size is not None:
         projects = random.sample(projects, sample_size)
 
-    # 3. Fetch data for each project
     logging.info("retrieving detailed project information")
     project_details = []
     for proj_name in tqdm(projects):
 
-        # 4. Fetch PyPI details
         fetch_status, http_response_code, pypi_data = _get_pypi_metadata(proj_name)
         pypi_classifiers = try_default(lambda: pypi_data["info"]["classifiers"])
         latest_pypi_tag = try_default(lambda: _get_latest_pypi_tag(pypi_data))
         pypi_project_urls = try_default(lambda: pypi_data["info"]["project_urls"])
 
-        # 5. Search for Github URL (+ redirect + to_lower)
         github_url = try_default(
             lambda: [url for _, url in pypi_project_urls.items() if _is_valid_github_url(url)][0]
         )
@@ -181,35 +170,34 @@ def sample_pypi_projects(
             github_url_status = None
         github_url = try_default(lambda: github_url.lower())
 
-        # 6. Fetch git tags
         git_tags: str = try_default(lambda: _get_git_tags(github_url))
 
-        # 7. match PyPI and git tag
         matching_github_tag = try_default(
             lambda: _match_pypi_git_tag(pypi_version=latest_pypi_tag, git_tags=git_tags)
         )
 
-        project_details.append(
-            {
-                # FlaPy Input columns
-                "Project_Name": proj_name,
-                "Github_URL": github_url,
-                "matching_github_tag": matching_github_tag,
-                "PYPI_latest_tag": latest_pypi_tag,
-                "funcs_to_trace": "",
-                "tests_to_run": "",
-                # other columns (ignored by FlaPy)
-                "pypi_fetch_status": fetch_status,
-                "pypi_http_response_code": http_response_code,
-                "PYPI_classifiers": pypi_classifiers,
-                "PYPI_project_urls": pypi_project_urls,
-                "github_url_status": github_url_status,
-                "git_tags": git_tags,
-            }
-        )
+        uses_poetry_pytest = _fetch_and_check_pyproject_toml(github_url)
+
+        if uses_poetry_pytest:
+            project_details.append(
+                {
+                    "Project_Name": proj_name,
+                    "Github_URL": github_url,
+                    "matching_github_tag": matching_github_tag,
+                    "PYPI_latest_tag": latest_pypi_tag,
+                    "funcs_to_trace": "",
+                    "tests_to_run": "",
+                    "pypi_fetch_status": fetch_status,
+                    "pypi_http_response_code": http_response_code,
+                    "PYPI_classifiers": pypi_classifiers,
+                    "PYPI_project_urls": pypi_project_urls,
+                    "github_url_status": github_url_status,
+                    "git_tags": git_tags,
+                }
+            )
+
     project_details = pd.DataFrame(project_details)
 
-    # 8. Drop duplicates (some PyPI projects point to the same GitHub URL)
     if remove_duplicates:
         num_duplicates = len(
             project_details[
@@ -221,7 +209,6 @@ def sample_pypi_projects(
             (~project_details.duplicated("Github_URL")) | (project_details["Github_URL"].isna())
         ]
 
-    # 9. Remove cases where no Github URL was found
     if remove_no_github_url_found:
         num_no_github_url_found = sum(project_details["Github_URL"].isna())
         logging.info(f"Dropped {num_no_github_url_found} projects where no GitHub URL was found")
